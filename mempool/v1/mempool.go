@@ -2,6 +2,7 @@ package v1
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sort"
 	"sync"
@@ -179,60 +180,23 @@ func (txmp *TxMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo memp
 	// During the initial phase of CheckTx, we do not need to modify any state.
 	// A transaction will not actually be added to the mempool until it survives
 	// a call to the ABCI CheckTx method and size constraint checks.
-	height, err := func() (int64, error) {
-		txmp.mtx.RLock()
-		defer txmp.mtx.RUnlock()
-
-		// Reject transactions in excess of the configured maximum transaction size.
-		if len(tx) > txmp.config.MaxTxBytes {
-			return 0, mempool.ErrTxTooLarge{Max: txmp.config.MaxTxBytes, Actual: len(tx)}
-		}
-
-		// If a precheck hook is defined, call it before invoking the application.
-		if txmp.preCheck != nil {
-			if err := txmp.preCheck(tx); err != nil {
-				return 0, mempool.ErrPreCheck{Reason: err}
-			}
-		}
-
-		// Early exit if the proxy connection has an error.
-		if err := txmp.proxyAppConn.Error(); err != nil {
-			return 0, err
-		}
-
-		txKey := tx.Key()
-
-		// Check for the transaction in the cache.
-		if !txmp.cache.Push(tx) {
-			// If the cached transaction is also in the pool, record its sender.
-			if elt, ok := txmp.txByKey[txKey]; ok {
-				w := elt.Value.(*WrappedTx)
-				w.SetPeer(txInfo.SenderID)
-			}
-			return 0, mempool.ErrTxInCache
-		}
-		return txmp.height, nil
-	}()
-	if err != nil {
-		return err
-	}
 
 	// Invoke an ABCI CheckTx for this transaction.
-	rsp, err := txmp.proxyAppConn.CheckTxSync(abci.RequestCheckTx{Tx: tx})
-	if err != nil {
-		txmp.cache.Remove(tx)
-		return err
+	rsp := abci.ResponseCheckTx{
+		GasWanted: 400000,
+		Priority:  math.MaxInt64,
+		Sender:    "",
 	}
 	wtx := &WrappedTx{
 		tx:        tx,
 		hash:      tx.Key(),
 		timestamp: time.Now().UTC(),
-		height:    height,
+		height:    txmp.height,
 	}
 	wtx.SetPeer(txInfo.SenderID)
-	txmp.addNewTransaction(wtx, rsp)
+	txmp.addNewTransaction(wtx, &rsp)
 	if cb != nil {
-		cb(&abci.Response{Value: &abci.Response_CheckTx{CheckTx: rsp}})
+		cb(&abci.Response{Value: &abci.Response_CheckTx{CheckTx: &rsp}})
 	}
 	return nil
 }
@@ -448,59 +412,8 @@ func (txmp *TxMempool) addNewTransaction(wtx *WrappedTx, checkTxRes *abci.Respon
 	txmp.mtx.Lock()
 	defer txmp.mtx.Unlock()
 
-	var err error
-	if txmp.postCheck != nil {
-		err = txmp.postCheck(wtx.tx, checkTxRes)
-	}
-
-	if err != nil || checkTxRes.Code != abci.CodeTypeOK {
-		txmp.logger.Info(
-			"rejected bad transaction",
-			"priority", wtx.Priority(),
-			"tx", fmt.Sprintf("%X", wtx.tx.Hash()),
-			"peer_id", wtx.peers,
-			"code", checkTxRes.Code,
-			"post_check_err", err,
-		)
-
-		txmp.metrics.FailedTxs.Add(1)
-
-		// Remove the invalid transaction from the cache, unless the operator has
-		// instructed us to keep invalid transactions.
-		if !txmp.config.KeepInvalidTxsInCache {
-			txmp.cache.Remove(wtx.tx)
-		}
-
-		// If there was a post-check error, record its text in the result for
-		// debugging purposes.
-		if err != nil {
-			checkTxRes.MempoolError = err.Error()
-		}
-		return
-	}
-
 	priority := checkTxRes.Priority
 	sender := checkTxRes.Sender
-
-	// Disallow multiple concurrent transactions from the same sender assigned
-	// by the ABCI application. As a special case, an empty sender is not
-	// restricted.
-	if sender != "" {
-		elt, ok := txmp.txBySender[sender]
-		if ok {
-			w := elt.Value.(*WrappedTx)
-			txmp.logger.Debug(
-				"rejected valid incoming transaction; tx already exists for sender",
-				"tx", fmt.Sprintf("%X", w.tx.Hash()),
-				"sender", sender,
-			)
-			checkTxRes.MempoolError =
-				fmt.Sprintf("rejected valid incoming transaction; tx already exists for sender %q (%X)",
-					sender, w.tx.Hash())
-			txmp.metrics.RejectedTxs.Add(1)
-			return
-		}
-	}
 
 	// At this point the application has ruled the transaction valid, but the
 	// mempool might be full. If so, find the lowest-priority items with lower
@@ -508,80 +421,11 @@ func (txmp *TxMempool) addNewTransaction(wtx *WrappedTx, checkTxRes *abci.Respon
 	// of them as necessary to make room for tx. If no such items exist, we
 	// discard tx.
 
-	if err := txmp.canAddTx(wtx); err != nil {
-		var victims []*clist.CElement // eligible transactions for eviction
-		var victimBytes int64         // total size of victims
-		for cur := txmp.txs.Front(); cur != nil; cur = cur.Next() {
-			cw := cur.Value.(*WrappedTx)
-			if cw.priority < priority {
-				victims = append(victims, cur)
-				victimBytes += cw.Size()
-			}
-		}
-
-		// If there are no suitable eviction candidates, or the total size of
-		// those candidates is not enough to make room for the new transaction,
-		// drop the new one.
-		if len(victims) == 0 || victimBytes < wtx.Size() {
-			txmp.cache.Remove(wtx.tx)
-			txmp.logger.Error(
-				"rejected valid incoming transaction; mempool is full",
-				"tx", fmt.Sprintf("%X", wtx.tx.Hash()),
-				"err", err.Error(),
-			)
-			checkTxRes.MempoolError =
-				fmt.Sprintf("rejected valid incoming transaction; mempool is full (%X)",
-					wtx.tx.Hash())
-			txmp.metrics.RejectedTxs.Add(1)
-			return
-		}
-
-		txmp.logger.Debug("evicting lower-priority transactions",
-			"new_tx", fmt.Sprintf("%X", wtx.tx.Hash()),
-			"new_priority", priority,
-		)
-
-		// Sort lowest priority items first so they will be evicted first.  Break
-		// ties in favor of newer items (to maintain FIFO semantics in a group).
-		sort.Slice(victims, func(i, j int) bool {
-			iw := victims[i].Value.(*WrappedTx)
-			jw := victims[j].Value.(*WrappedTx)
-			if iw.Priority() == jw.Priority() {
-				return iw.timestamp.After(jw.timestamp)
-			}
-			return iw.Priority() < jw.Priority()
-		})
-
-		// Evict as many of the victims as necessary to make room.
-		var evictedBytes int64
-		for _, vic := range victims {
-			w := vic.Value.(*WrappedTx)
-
-			txmp.logger.Debug(
-				"evicted valid existing transaction; mempool full",
-				"old_tx", fmt.Sprintf("%X", w.tx.Hash()),
-				"old_priority", w.priority,
-			)
-			txmp.removeTxByElement(vic)
-			txmp.cache.Remove(w.tx)
-			txmp.metrics.EvictedTxs.Add(1)
-
-			// We may not need to evict all the eligible transactions.  Bail out
-			// early if we have made enough room.
-			evictedBytes += w.Size()
-			if evictedBytes >= wtx.Size() {
-				break
-			}
-		}
-	}
-
 	wtx.SetGasWanted(checkTxRes.GasWanted)
 	wtx.SetPriority(priority)
 	wtx.SetSender(sender)
 	txmp.insertTx(wtx)
 
-	txmp.metrics.TxSizeBytes.Observe(float64(wtx.Size()))
-	txmp.metrics.Size.Set(float64(txmp.Size()))
 	txmp.logger.Debug(
 		"inserted new valid transaction",
 		"priority", wtx.Priority(),

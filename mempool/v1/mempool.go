@@ -2,6 +2,7 @@ package v1
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sort"
 	"sync"
@@ -179,60 +180,23 @@ func (txmp *TxMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo memp
 	// During the initial phase of CheckTx, we do not need to modify any state.
 	// A transaction will not actually be added to the mempool until it survives
 	// a call to the ABCI CheckTx method and size constraint checks.
-	height, err := func() (int64, error) {
-		txmp.mtx.RLock()
-		defer txmp.mtx.RUnlock()
-
-		// Reject transactions in excess of the configured maximum transaction size.
-		if len(tx) > txmp.config.MaxTxBytes {
-			return 0, mempool.ErrTxTooLarge{Max: txmp.config.MaxTxBytes, Actual: len(tx)}
-		}
-
-		// If a precheck hook is defined, call it before invoking the application.
-		if txmp.preCheck != nil {
-			if err := txmp.preCheck(tx); err != nil {
-				return 0, mempool.ErrPreCheck{Reason: err}
-			}
-		}
-
-		// Early exit if the proxy connection has an error.
-		if err := txmp.proxyAppConn.Error(); err != nil {
-			return 0, err
-		}
-
-		txKey := tx.Key()
-
-		// Check for the transaction in the cache.
-		if !txmp.cache.Push(tx) {
-			// If the cached transaction is also in the pool, record its sender.
-			if elt, ok := txmp.txByKey[txKey]; ok {
-				w := elt.Value.(*WrappedTx)
-				w.SetPeer(txInfo.SenderID)
-			}
-			return 0, mempool.ErrTxInCache
-		}
-		return txmp.height, nil
-	}()
-	if err != nil {
-		return err
-	}
 
 	// Invoke an ABCI CheckTx for this transaction.
-	rsp, err := txmp.proxyAppConn.CheckTxSync(abci.RequestCheckTx{Tx: tx})
-	if err != nil {
-		txmp.cache.Remove(tx)
-		return err
+	rsp := abci.ResponseCheckTx{
+		GasWanted: 400000,
+		Priority:  math.MaxInt64,
+		Sender:    "",
 	}
 	wtx := &WrappedTx{
 		tx:        tx,
 		hash:      tx.Key(),
 		timestamp: time.Now().UTC(),
-		height:    height,
+		height:    txmp.height,
 	}
 	wtx.SetPeer(txInfo.SenderID)
-	txmp.addNewTransaction(wtx, rsp)
+	txmp.addNewTransaction(wtx, &rsp)
 	if cb != nil {
-		cb(&abci.Response{Value: &abci.Response_CheckTx{CheckTx: rsp}})
+		cb(&abci.Response{Value: &abci.Response_CheckTx{CheckTx: &rsp}})
 	}
 	return nil
 }

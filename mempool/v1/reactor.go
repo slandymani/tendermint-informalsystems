@@ -213,7 +213,7 @@ type PeerState interface {
 
 // Send new mempool txs to peer.
 func (memR *Reactor) broadcastTxRoutine(peer p2p.Peer) {
-	peerID := memR.ids.GetForPeer(peer)
+	//peerID := memR.ids.GetForPeer(peer)
 	var next *clist.CElement
 
 	for {
@@ -240,36 +240,17 @@ func (memR *Reactor) broadcastTxRoutine(peer p2p.Peer) {
 			}
 		}
 
-		// Make sure the peer is up to date.
-		peerState, ok := peer.Get(types.PeerStateKey).(PeerState)
-		if !ok {
-			// Peer does not have a state yet. We set it in the consensus reactor, but
-			// when we add peer in Switch, the order we call reactors#AddPeer is
-			// different every time due to us using a map. Sometimes other reactors
-			// will be initialized before the consensus reactor. We should wait a few
-			// milliseconds and retry.
-			time.Sleep(mempool.PeerCatchupSleepIntervalMS * time.Millisecond)
-			continue
-		}
-
-		// Allow for a lag of 1 block.
 		memTx := next.Value.(*WrappedTx)
-		if peerState.GetHeight() < memTx.height-1 {
-			time.Sleep(mempool.PeerCatchupSleepIntervalMS * time.Millisecond)
-			continue
-		}
 
 		// NOTE: Transaction batching was disabled due to
 		// https://github.com/tendermint/tendermint/issues/5796
-		if !memTx.HasPeer(peerID) {
-			success := p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
-				ChannelID: mempool.MempoolChannel,
-				Message:   &protomem.Txs{Txs: [][]byte{memTx.tx}},
-			}, memR.Logger)
-			if !success {
-				time.Sleep(mempool.PeerCatchupSleepIntervalMS * time.Millisecond)
-				continue
-			}
+		success := p2p.SendEnvelopeShim(peer, p2p.Envelope{ //nolint: staticcheck
+			ChannelID: mempool.MempoolChannel,
+			Message:   &protomem.Txs{Txs: [][]byte{memTx.tx}},
+		}, memR.Logger)
+		if !success {
+			time.Sleep(mempool.PeerCatchupSleepIntervalMS * time.Millisecond)
+			continue
 		}
 
 		select {
